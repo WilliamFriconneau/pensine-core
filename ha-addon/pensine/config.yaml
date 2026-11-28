@@ -1,5 +1,5 @@
 name: Pensine
-version: "0.1.9"
+version: "0.1.10"
 slug: pensine
 description: Memory for assistants over MCP, with one account per Home Assistant user
 arch:
