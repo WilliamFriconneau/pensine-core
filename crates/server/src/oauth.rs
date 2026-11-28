@@ -310,6 +310,7 @@ fn hash(value: &str) -> [u8; 32] {
 
 enum OAuthError {
     BadRequest(&'static str),
+    InvalidClient,
     RegistrationCapacity,
     Internal,
 }
@@ -318,6 +319,7 @@ impl IntoResponse for OAuthError {
     fn into_response(self) -> Response {
         let (status, error) = match self {
             Self::BadRequest(error) => (StatusCode::BAD_REQUEST, error),
+            Self::InvalidClient => (StatusCode::UNAUTHORIZED, "invalid_client"),
             Self::RegistrationCapacity => {
                 (StatusCode::SERVICE_UNAVAILABLE, "registration_capacity")
             }

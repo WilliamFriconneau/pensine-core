@@ -3,20 +3,70 @@ use super::{
     Result, ACCESS_TTL, REFRESH_TTL,
 };
 use axum::extract::{Form, State};
+use axum::http::{header, HeaderMap};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::json;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 
+/// The client credentials of a token request: HTTP Basic (`client_secret_basic`) or the form fields
+/// (`client_secret_post`, or `client_id` alone for a public client).
+fn credentials(headers: &HeaderMap, fields: &Fields) -> (String, Option<String>) {
+    if let Some((id, secret)) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .strip_prefix("Basic ")
+                .or_else(|| value.strip_prefix("basic "))
+        })
+        .and_then(|encoded| STANDARD.decode(encoded.trim()).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|pair| {
+            pair.split_once(':')
+                .map(|(id, secret)| (id.to_owned(), secret.to_owned()))
+        })
+    {
+        let id = urlencoding_decode(&id);
+        let secret = urlencoding_decode(&secret);
+        return (id, Some(secret));
+    }
+    let secret = field(fields, "client_secret");
+    (
+        field(fields, "client_id").to_owned(),
+        (!secret.is_empty()).then(|| secret.to_owned()),
+    )
+}
+
+/// RFC 6749 section 2.3.1: Basic credentials are form-urlencoded before being base64 encoded.
+fn urlencoding_decode(value: &str) -> String {
+    url::form_urlencoded::parse(format!("v={value}").as_bytes())
+        .next()
+        .map(|(_, decoded)| decoded.into_owned())
+        .unwrap_or_default()
+}
+
 pub(super) async fn token(
     State(oauth): State<Arc<OAuth>>,
+    headers: HeaderMap,
     Form(fields): Form<Fields>,
 ) -> Result<Response> {
     resource_matches(&oauth, &fields)?;
-    let client = field(&fields, "client_id");
+    let (client_id, secret) = credentials(&headers, &fields);
+    let client = client_id.as_str();
+    // A client that registered with a secret must present it (PKCE is still required below); a public one has none.
+    if let Some(expected) = oauth.client_secret_hash(client)? {
+        let presented = secret.as_deref().map(hash);
+        if !presented.is_some_and(|presented| bool::from(presented.as_slice().ct_eq(&expected))) {
+            return Err(OAuthError::InvalidClient);
+        }
+    }
     let mut db = oauth.db()?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let scope: String = match field(&fields, "grant_type") {

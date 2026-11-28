@@ -1,6 +1,6 @@
 use super::consent::{authorize, consent};
 use super::token::token;
-use super::{random_secret, OAuth, OAuthError, Result};
+use super::{hash, random_secret, OAuth, OAuthError, Result};
 use crate::config::parse_web_url;
 use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -83,7 +83,7 @@ async fn authorization_server(State(oauth): State<Arc<OAuth>>) -> Json<Value> {
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
         "authorization_response_iss_parameter_supported": true,
         "scopes_supported": ["memory"],
     }))
@@ -111,30 +111,38 @@ async fn register(
     {
         return Err(OAuthError::BadRequest("invalid_redirect_uri"));
     }
-    if registration
+    // Claude and other assistants may register as confidential clients: accept the three methods the earlier
+    // implementation did. A confidential client gets a secret, checked at the token endpoint on top of PKCE.
+    let method = registration
         .token_endpoint_auth_method
         .as_deref()
-        .is_some_and(|method| method != "none")
-    {
+        .unwrap_or("none")
+        .to_owned();
+    if !matches!(
+        method.as_str(),
+        "none" | "client_secret_post" | "client_secret_basic"
+    ) {
         return Err(OAuthError::BadRequest("invalid_client_metadata"));
     }
+    let secret = (method != "none").then(random_secret).transpose()?;
     let name = registration
         .client_name
         .unwrap_or_else(|| "OAuth client".into());
     let id = random_secret()?;
-    oauth.register_client(&id, &name, &redirects)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({
-            "client_id": id,
-            "client_name": name,
-            "redirect_uris": redirects,
-            "token_endpoint_auth_method": "none",
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
-        })),
-    )
-        .into_response())
+    oauth.register_client(&id, &name, &redirects, secret.as_deref().map(hash))?;
+    let mut body = json!({
+        "client_id": id,
+        "client_name": name,
+        "redirect_uris": redirects,
+        "token_endpoint_auth_method": method,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+    });
+    if let Some(secret) = secret {
+        body["client_secret"] = json!(secret);
+        body["client_secret_expires_at"] = json!(0);
+    }
+    Ok((StatusCode::CREATED, Json(body)).into_response())
 }
 
 async fn oauth_no_store(request: Request, next: Next) -> Response {

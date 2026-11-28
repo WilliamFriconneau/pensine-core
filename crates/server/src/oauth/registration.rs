@@ -4,6 +4,7 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use rusqlite::OptionalExtension;
 use rusqlite::{Connection, TransactionBehavior};
 use serde_json::json;
 use std::collections::HashMap;
@@ -68,6 +69,14 @@ pub(super) fn migrate(db: &Connection, cap: usize) -> rusqlite::Result<()> {
         [],
         |row| row.get(0),
     )?;
+    let has_secret: bool = db.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('oauth_clients') WHERE name = 'secret_hash')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_secret {
+        db.execute_batch("ALTER TABLE oauth_clients ADD COLUMN secret_hash BLOB;")?;
+    }
     if !has_last_used {
         db.execute_batch(
             "ALTER TABLE oauth_clients ADD COLUMN last_used INTEGER NOT NULL DEFAULT 0;
@@ -94,7 +103,26 @@ fn purge(db: &Connection) -> rusqlite::Result<()> {
 }
 
 impl OAuth {
-    pub(super) fn register_client(&self, id: &str, name: &str, redirects: &[String]) -> Result<()> {
+    /// The secret hash of a client, when it registered as a confidential one (`client_secret_post` or `_basic`).
+    pub(super) fn client_secret_hash(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        let db = self.db()?;
+        Ok(db
+            .query_row(
+                "SELECT secret_hash FROM oauth_clients WHERE id = ?1",
+                [id],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    pub(super) fn register_client(
+        &self,
+        id: &str,
+        name: &str,
+        redirects: &[String],
+        secret_hash: Option<[u8; 32]>,
+    ) -> Result<()> {
         let redirects = serde_json::to_string(redirects)?;
         let mut db = self.db()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -106,8 +134,9 @@ impl OAuth {
             return Err(OAuthError::RegistrationCapacity);
         }
         tx.execute(
-            "INSERT INTO oauth_clients (id, name, redirects, last_used) VALUES (?1, ?2, ?3, unixepoch())",
-            (id, name, redirects),
+            "INSERT INTO oauth_clients (id, name, redirects, last_used, secret_hash)
+             VALUES (?1, ?2, ?3, unixepoch(), ?4)",
+            (id, name, redirects, secret_hash.map(|hash| hash.to_vec())),
         )?;
         tx.commit()?;
         Ok(())
