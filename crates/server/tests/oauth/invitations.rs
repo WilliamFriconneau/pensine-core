@@ -183,3 +183,27 @@ async fn a_consent_post_from_another_origin_is_refused_with_a_readable_page_not_
     assert!(response.content_type().starts_with("text/html"));
     assert!(!response.into_string().unwrap().contains("access_denied"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_form_post_with_a_null_origin_from_the_consent_page_is_accepted() {
+    // The consent page sends Referrer-Policy: no-referrer, so browsers post it with Origin: null.
+    let env = Fixture::start().await;
+    let client = env.client();
+    let code = env.handle.oauth_invitation("demo").unwrap();
+    let mut fields = env.authorize_fields(&client, "S256");
+    fields.push(("invite", code));
+    let response = env
+        .agent
+        .post(&env.url("/authorize"))
+        .set("Origin", "null")
+        .set("Sec-Fetch-Site", "same-origin")
+        .send_form(
+            &fields
+                .iter()
+                .map(|(k, v)| (*k, v.as_str()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(status_response);
+    assert_eq!(response.status(), 200);
+    assert!(response.into_string().unwrap().contains("name=\"nonce\""));
+}

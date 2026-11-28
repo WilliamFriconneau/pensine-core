@@ -156,10 +156,14 @@ pub(super) async fn consent(
     if headers
         .get("sec-fetch-site")
         .is_some_and(|site| site == "cross-site")
+        // The consent page sends `Referrer-Policy: no-referrer`, and a browser then serialises the Origin of a form
+        // post as the string "null": that is a normal same-site post, not a foreign one. Any other origin that is
+        // not the issuer's is refused.
         || headers.get(header::ORIGIN).is_some_and(|origin| {
-            parse_public_origin(&oauth.issuer()).is_none_or(|url| {
-                origin.as_bytes() != url.origin().ascii_serialization().as_bytes()
-            })
+            origin.as_bytes() != b"null"
+                && parse_public_origin(&oauth.issuer()).is_none_or(|url| {
+                    origin.as_bytes() != url.origin().ascii_serialization().as_bytes()
+                })
         })
     {
         tracing::warn!(
